@@ -19,6 +19,7 @@ import time
 import math
 import json
 from pathlib import Path
+import mlflow
 
 import numpy as np
 from PIL import Image
@@ -42,6 +43,8 @@ def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
 
     # Model parameters
+    parser.add_argument('--experiment_name', default = 'dino', type = str,
+        help="""Name of the experiment to use for mlfow purposes""")
     parser.add_argument('--arch', default='vit_small', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
@@ -274,6 +277,9 @@ def train_dino(args):
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
+        # ============ write training stats to mlflow ============
+        mlflow.log_metrics(train_stats, step = len(data_loader) * epoch)
+        
         # ============ writing logs ... ============
         save_dict = {
             'student': student.state_dict(),
@@ -468,4 +474,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_dino(args)
+    # ============ Initialize mlflow information ==========
+    experiment = mlflow.set_experiment(args.experiment_name)
+    
+    with mlflow.start_run(experiment_id = experiment.experiment_id):
+        # ========== Store all dino arguments ========
+        mlflow.log_params(vars(args))
+        train_dino(args)
