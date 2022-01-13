@@ -122,6 +122,8 @@ def get_args_parser():
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--stratify_on_targets', default = False, type = utils.bool_flag,
+        help="""Sets whether the model with stratify sampling on the targets available (default: True) or not.""")
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -145,8 +147,20 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # If the datapath is the specific keyword for using the ApertureDB dataset, use it
+    # instead of the standard ImageFolder dataset
+    if args.data_path == "thd_aperturedb":
+        dataset = utils.THDApertureDBDataset(utils.dbinfo, transform=transform)
+    else:
+        dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    
+    # If given a label path, perform stratified sampling with the labels of 
+    # the csv given and a new stratified sampler. Otherwise, use the normal
+    # DistributedSampler
+    if args.stratify_on_targets:
+        sampler = utils.StratifiedSampler(class_vector = dataset.targets, batch_size = args.batch_size_per_gpu)
+    else:
+        sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
