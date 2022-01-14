@@ -150,7 +150,7 @@ def train_dino(args):
     # If the datapath is the specific keyword for using the ApertureDB dataset, use it
     # instead of the standard ImageFolder dataset
     if args.data_path == "thd_aperturedb":
-        dataset = utils.THDApertureDBDataset(utils.dbinfo, transform=transform)
+        dataset = utils.THDApertureDBDataset(utils.dbinfo, transform=transform, apdb_img_limit = 500000)
     else:
         dataset = datasets.ImageFolder(args.data_path, transform=transform)
     

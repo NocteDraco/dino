@@ -31,7 +31,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
+from PIL import ImageFilter, ImageOps, Image
 from aperturedb import Connector, Status, PyTorchDataset
 
 
@@ -889,17 +889,22 @@ class StratifiedSampler(Sampler):
 class dbinfo():
     
     DB_HOST="localhost"
-    DB_PORT=10009
+    DB_PORT=10011
     DB_USER="admin"
     DB_PASSWORD="admin"
 
 # New dataset class that uses ApertureDB calls to get data
 class THDApertureDBDataset(Dataset):
-    def __init__(self, dbinfo, transform = None, apdb_img_limit = 1000000):
+    def __init__(self, dbinfo, transform = None, batch_size = None, apdb_img_limit = 1000000):
         """
         """
         self.dbinfo = dbinfo
         self.apdb_img_limit = apdb_img_limit
+        self.transform = transform
+        self.batch_size = batch_size
+        
+        
+        self.__init_link__()
         
     def __init_link__(self):
         """
@@ -911,12 +916,19 @@ class THDApertureDBDataset(Dataset):
         # Query used in the PyTorchDataset call
         apdb_pytorchds_query = [
         {"FindImage":{
-            "results": {"limit": self.adb_img_limit},
-        }
+            "results": {"limit": self.apdb_img_limit},
+            "operations":  [
+                {
+                    "type": "resize",
+                    "width":  224,
+                    "height": 224,
+                }
+            ],
+            }
         }
         ]
         
-        self.dataset = PyTorchDataset.ApertureDBDataset(db, apdb_pytorchds_query, label_prop = None)
+        self.dataset = PyTorchDataset.ApertureDBDataset(self.db, apdb_pytorchds_query, label_prop = None)
         
         
     def __len__(self):
@@ -931,7 +943,10 @@ class THDApertureDBDataset(Dataset):
         """
         _img, _lbl = self.dataset[index]
         
+        # Convert image from numpy array to PIL image
+        _img = Image.fromarray(_img)
+        
         # Apply the transformation to the image
         img = self.transform(_img)
         
-        return img
+        return img, _lbl
