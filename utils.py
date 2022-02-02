@@ -19,9 +19,12 @@ https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
 import os
 import sys
+import cv2
 import time
 import math
 import random
+import mlflow
+import urllib
 import datetime
 import subprocess
 from collections import defaultdict, deque
@@ -331,6 +334,15 @@ class MetricLogger(object):
             return self.__dict__[attr]
         raise AttributeError("'{}' object has no attribute '{}'".format(
             type(self).__name__, attr))
+        
+    def logMLFlow(self, step):
+        """
+        Build a dictionary of the meters and log it
+        """
+        diag = {name: meter.avg for name, meter in self.meters.items()}
+        
+        mlflow.log_metrics(diag, step = step)
+        return
 
     def __str__(self):
         loss_str = []
@@ -347,7 +359,7 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None):
+    def log_every(self, iterable, print_freq, epoch, header=None):
         i = 0
         if not header:
             header = ''
@@ -394,10 +406,14 @@ class MetricLogger(object):
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time)))
+                it = len(iterable) * epoch + i  # global training iteration
+                self.logMLFlow(it)
+                
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        
         print('{} Total time: {} ({:.6f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
 
@@ -893,6 +909,65 @@ class dbinfo():
     DB_USER="admin"
     DB_PASSWORD="admin"
 
+# New dataset class wrapping a URL call for the 
+class THDURLDataset(Dataset):
+    def __init__(self, df, transform = None, label_col = None):
+        """
+        A PyTorch dataset that uses urllib to request images on the fly.
+        
+        The pandas dataframe input argument `df` must have an image_url column
+        """
+        self.df = df
+        self.transform = transform        
+        self.label_col = label_col
+
+    def __download_image(self, url):
+        
+        if url[:6] != "https:":
+            url = "https://idm.homedepot.com/assets/image/"+url[:2]+"/"+url+".jpg"
+        try:
+            resp = urllib.request.urlopen(url)
+            image = np.asarray(bytearray(resp.read()), dtype="uint8")
+            image = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            return image
+        except:
+            return None
+
+        
+    def __len__(self):
+        return len(self.df)
+    
+
+    def __getitem__(self, index):
+        """
+        """
+        # Get the image from the URL
+        url = self.df['image_url'].iloc[index]
+        _img = self.__download_image(url)
+        
+        if _img is None:
+            return None
+        
+        # Convert image from numpy array to PIL image
+        _img = Image.fromarray(_img)
+        
+        # Transform the image
+        img = self.transform(_img)
+        
+        # Gather label is column given
+        if self.label_col is not None:
+            lbl = self.df[self.label_col].iloc[index]
+        else:
+            lbl = "none"
+            
+        return img, lbl
+
+def collate_fn(batch):
+    batch = list(filter(lambda x: x is not None, batch))
+    return torch.utils.data.dataloader.default_collate(batch)
+        
+        
+    
 # New dataset class that uses ApertureDB calls to get data
 class THDApertureDBDataset(Dataset):
     def __init__(self, dbinfo, transform = None, batch_size = None, apdb_img_limit = 1000000):
@@ -940,7 +1015,10 @@ class THDApertureDBDataset(Dataset):
         """
         Get the item from the dataset and apply the transformation 
         stored in the class
+        
+    
         """
+        
         _img, _lbl = self.dataset[index]
         
         # Convert image from numpy array to PIL image
