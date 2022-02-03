@@ -19,6 +19,7 @@ import time
 import math
 import json
 from pathlib import Path
+import pandas as pd
 import mlflow
 
 import numpy as np
@@ -43,8 +44,10 @@ def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
 
     # Model parameters
-    parser.add_argument('--experiment_name', default = 'dino', type = str,
-        help="""Name of the experiment to use for mlfow purposes""")
+    parser.add_argument('--load_weights', default = None, type = str, 
+        help = """File path of weights to load into the model. Note that this does not 
+        restore epoch status as would if the output directory checkpoint.pth file exists. 
+        These weights will be overwritten if the output checkpoint.pth does exist""")
     parser.add_argument('--arch', default='vit_small', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
@@ -120,8 +123,12 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
+    parser.add_argument('--experiment_name', default = 'dino', type = str,
+        help="""Name of the experiment to use for mlfow purposes""")
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--stratify_on_targets', default = False, type = utils.bool_flag,
+        help="""Sets whether the model with stratify sampling on the targets available (default: True) or not.""")
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -135,7 +142,12 @@ def get_args_parser():
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    
+    git_sha = utils.get_sha()
+    print("git:\n  {}\n".format(git_sha))
+    mlflow.log_param("git_sha", git_sha)
+    
+    
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
@@ -145,8 +157,29 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # If the datapath is the specific keyword for using the ApertureDB dataset, use it
+    # instead of the standard ImageFolder dataset
+    if args.data_path == "thd_aperturedb":
+        dataset = utils.THDApertureDBDataset(utils.dbinfo, transform=transform, apdb_img_limit = 50000)
+    
+    
+    
+    
+    
+    elif args.data_path.endswith('.csv'):
+        df = pd.read_csv(args.data_path)
+        dataset = utils.THDURLDataset(df, transform = transform)
+    else:
+        dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    
+    # If given a label path, perform stratified sampling with the labels of 
+    # the csv given and a new stratified sampler. Otherwise, use the normal
+    # DistributedSampler
+    if args.stratify_on_targets:
+        sampler = utils.StratifiedSampler(class_vector = dataset.targets, batch_size = args.batch_size_per_gpu)
+    else:
+        sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
@@ -154,7 +187,9 @@ def train_dino(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn = utils.collate_fn,
     )
+
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
@@ -254,6 +289,17 @@ def train_dino(args):
                                                args.epochs, len(data_loader))
     print(f"Loss, optimizer and schedulers ready.")
 
+    # ============ 
+    # Load weights if given, note that these weights will be overridden if checkpoint.pth 
+    # exists in the output directory
+    # ============
+    if args.load_weights is not None:
+        # Does not update the epochs, optimizer, scaler, or loss at all, only weights
+        utils.restart_from_checkpoint(args.load_weights,
+                                     student = student,
+                                     teacher = teacher)
+        
+    
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     utils.restart_from_checkpoint(
@@ -277,8 +323,7 @@ def train_dino(args):
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
-        # ============ write training stats to mlflow ============
-        mlflow.log_metrics(train_stats, step = len(data_loader) * epoch)
+        
         
         # ============ writing logs ... ============
         save_dict = {
@@ -296,6 +341,10 @@ def train_dino(args):
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
+        
+        # ============ write training stats to mlflow ============
+        mlflow.log_metrics(log_stats, step = len(data_loader) * epoch)
+        
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -309,7 +358,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    
+    
+    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, epoch, header)):
+               
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -360,10 +412,12 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+        
+        
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k + "_epoch": meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 class DINOLoss(nn.Module):
@@ -423,7 +477,14 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, resize_first = 512):
+        
+
+        # New transformation: resize first the image to a comensurate size as Imagenet
+        resize_first_transfo = transforms.Compose([
+                transforms.Resize(512)
+        ])
+        
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -468,7 +529,6 @@ class DataAugmentationDINO(object):
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
         return crops
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])

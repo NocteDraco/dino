@@ -19,9 +19,12 @@ https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
 import os
 import sys
+import cv2
 import time
 import math
 import random
+import mlflow
+import urllib
 import datetime
 import subprocess
 from collections import defaultdict, deque
@@ -29,8 +32,10 @@ from collections import defaultdict, deque
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.data import Dataset
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
+from PIL import ImageFilter, ImageOps, Image
+from aperturedb import Connector, Status, PyTorchDataset
 
 
 class GaussianBlur(object):
@@ -329,6 +334,15 @@ class MetricLogger(object):
             return self.__dict__[attr]
         raise AttributeError("'{}' object has no attribute '{}'".format(
             type(self).__name__, attr))
+        
+    def logMLFlow(self, step):
+        """
+        Build a dictionary of the meters and log it
+        """
+        diag = {name: meter.avg for name, meter in self.meters.items()}
+        
+        mlflow.log_metrics(diag, step = step)
+        return
 
     def __str__(self):
         loss_str = []
@@ -345,7 +359,7 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None):
+    def log_every(self, iterable, print_freq, epoch, header=None):
         i = 0
         if not header:
             header = ''
@@ -392,10 +406,14 @@ class MetricLogger(object):
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time)))
+                it = len(iterable) * epoch + i  # global training iteration
+                self.logMLFlow(it)
+                
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        
         print('{} Total time: {} ({:.6f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
 
@@ -827,3 +845,186 @@ def multi_scale(samples, model):
     v /= 3
     v /= v.norm()
     return v
+
+
+class Sampler(object):
+    """Base class for all Samplers.
+    Every Sampler subclass has to provide an __iter__ method, providing a way
+    to iterate over indices of dataset elements, and a __len__ method that
+    returns the length of the returned iterators.
+    """
+
+    def __init__(self, data_source):
+        pass
+
+    def __iter__(self):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+class StratifiedSampler(Sampler):
+    """Stratified Sampling
+    Provides equal representation of target classes in each batch
+    """
+    def __init__(self, class_vector, batch_size, test_size = 0.5):
+        """
+        Arguments
+        ---------
+        class_vector : torch tensor
+            a vector of class labels
+        batch_size : integer
+            batch_size
+        """
+        self.n_splits = int(class_vector.size(0) / batch_size)
+        self.class_vector = class_vector
+
+    def gen_sample_array(self):
+        try:
+            from sklearn.model_selection import StratifiedShuffleSplit
+        except:
+            print('Need scikit-learn for this functionality')
+        import numpy as np
+        
+        s = StratifiedShuffleSplit(n_splits=self.n_splits, test_size=test_size)
+        X = th.randn(self.class_vector.size(0),2).numpy()
+        y = self.class_vector.numpy()
+        s.get_n_splits(X, y)
+
+        train_index, test_index = next(s.split(X, y))
+        return np.hstack([train_index, test_index])
+
+    def __iter__(self):
+        return iter(self.gen_sample_array())
+
+    def __len__(self):
+        return len(self.class_vector)
+
+
+# +
+# Database information for connecting to the ApertureDB database
+class dbinfo():
+    
+    DB_HOST="localhost"
+    DB_PORT=10011
+    DB_USER="admin"
+    DB_PASSWORD="admin"
+
+# New dataset class wrapping a URL call for the 
+class THDURLDataset(Dataset):
+    def __init__(self, df, transform = None, label_col = None):
+        """
+        A PyTorch dataset that uses urllib to request images on the fly.
+        
+        The pandas dataframe input argument `df` must have an image_url column
+        """
+        self.df = df
+        self.transform = transform        
+        self.label_col = label_col
+
+    def __download_image(self, url):
+        
+        if url[:6] != "https:":
+            url = "https://idm.homedepot.com/assets/image/"+url[:2]+"/"+url+".jpg"
+        try:
+            resp = urllib.request.urlopen(url)
+            image = np.asarray(bytearray(resp.read()), dtype="uint8")
+            image = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            return image
+        except:
+            return None
+
+        
+    def __len__(self):
+        return len(self.df)
+    
+
+    def __getitem__(self, index):
+        """
+        """
+        # Get the image from the URL
+        url = self.df['image_url'].iloc[index]
+        _img = self.__download_image(url)
+        
+        if _img is None:
+            return None
+        
+        # Convert image from numpy array to PIL image
+        _img = Image.fromarray(_img)
+        
+        # Transform the image
+        img = self.transform(_img)
+        
+        # Gather label is column given
+        if self.label_col is not None:
+            lbl = self.df[self.label_col].iloc[index]
+        else:
+            lbl = "none"
+            
+        return img, lbl
+
+def collate_fn(batch):
+    batch = list(filter(lambda x: x is not None, batch))
+    return torch.utils.data.dataloader.default_collate(batch)
+        
+        
+    
+# New dataset class that uses ApertureDB calls to get data
+class THDApertureDBDataset(Dataset):
+    def __init__(self, dbinfo, transform = None, batch_size = None, apdb_img_limit = 1000000):
+        """
+        """
+        self.dbinfo = dbinfo
+        self.apdb_img_limit = apdb_img_limit
+        self.transform = transform
+        self.batch_size = batch_size
+        
+        
+        self.__init_link__()
+        
+    def __init_link__(self):
+        """
+        Initialize the database link with the given information
+        """
+        # Build the database and store internally
+        self.db = Connector.Connector(self.dbinfo.DB_HOST, self.dbinfo.DB_PORT, user=self.dbinfo.DB_USER, password=self.dbinfo.DB_PASSWORD)
+            
+        # Query used in the PyTorchDataset call
+        apdb_pytorchds_query = [
+        {"FindImage":{
+            "results": {"limit": self.apdb_img_limit},
+            "operations":  [
+                {
+                    "type": "resize",
+                    "width":  224,
+                    "height": 224,
+                }
+            ],
+            }
+        }
+        ]
+        
+        self.dataset = PyTorchDataset.ApertureDBDataset(self.db, apdb_pytorchds_query, label_prop = None)
+        
+        
+    def __len__(self):
+        """
+        """
+        return len(self.dataset)
+    
+    def __getitem__(self, index):
+        """
+        Get the item from the dataset and apply the transformation 
+        stored in the class
+        
+    
+        """
+        
+        _img, _lbl = self.dataset[index]
+        
+        # Convert image from numpy array to PIL image
+        _img = Image.fromarray(_img)
+        
+        # Apply the transformation to the image
+        img = self.transform(_img)
+        
+        return img, _lbl
